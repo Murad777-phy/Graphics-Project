@@ -1,40 +1,33 @@
-"""
-TODO:
-  - LiDAR integration (ROS subscriber + point merge)
-  - Manual camera orbit controls (mouse drag)
-  - Bounding boxes around obstacle clusters
-  - Depth estimation improvements (stereo or learned monocular)
-"""
-
 import sys
 import math
 import numpy as np
 import cv2
 import pygame
-from pygame.locals import DOUBLEBUF, OPENGL, QUIT, KEYDOWN, K_ESCAPE, K_q, K_p
-from OpenGL.GL import (
-    glBegin, glEnd, glVertex3f, glColor3f, glColor4f,
-    glPointSize, glLineWidth, glEnable, glClear, glClearColor,
-    glLoadIdentity, glMatrixMode, glTranslatef, glRotatef,
-    glBindTexture, glGenTextures, glTexImage2D, glTexParameteri,
-    glBlendFunc, glDepthMask, glDisable,
-    GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT,
-    GL_POINTS, GL_LINES, GL_QUADS,
-    GL_MODELVIEW, GL_PROJECTION, GL_TEXTURE_2D,
-    GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER,
-    GL_LINEAR, GL_RGB, GL_RGBA, GL_UNSIGNED_BYTE,
-    GL_BLEND, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
-    GL_DEPTH_TEST, GL_FALSE, GL_TRUE,
-    glDeleteTextures,
-)
-from OpenGL.GLU import gluPerspective, gluOrtho2D
+from pygame.locals import *
+from OpenGL.GL import *
+from OpenGL.GLU import *
+from sklearn.cluster import DBSCAN
+import threading
+import time
+import torch
 
+# --- Configuration ---
+WINDOW_W, WINDOW_H = 1100, 700
+CAM_W, CAM_H = 1280, 720
+CAM_FPS      = 30
+MIDAS_W, MIDAS_H = 640, 480
 
-WINDOW_W  = 1100
-WINDOW_H  = 700
-DEPTH_MAX = 3.5
-EDGE_STEP = 10
-MAX_PTS   = 2000
+DEPTH_MAX = 10.0
+DEPTH_MIN = 0.5
+DEPTH_SCALE = 1.0
+DEPTH_OFFSET = 0.0
+
+CAM_FOV_DEG = 37.0
+GRID_STEP  = 12
+MAX_PTS    = 5000
+DBSCAN_EPS     = 0.5
+DBSCAN_MIN_PTS = 10
+DBSCAN_EVERY   = 2
 
 CLASS_COLOR = {
     "obstacle" : (1.0, 0.3, 0.2),
@@ -42,228 +35,359 @@ CLASS_COLOR = {
     "boundary" : (0.2, 0.8, 1.0),
 }
 
+# --- UI Components ---
+class Slider:
+    def __init__(self, x, y, w, h, label, min_val, max_val, initial):
+        self.rect = pygame.Rect(x, y, w, h)
+        self.label = label
+        self.min_val = min_val
+        self.max_val = max_val
+        self.val = initial
+        self.grabbed = False
 
-def pixel_to_3d(u, v, img_w, img_h):
-    t  = v / img_h
-    z  = DEPTH_MAX * (1.0 - t * 0.65 + 0.1)
-    fx = (img_w / 2.0) / math.tan(math.radians(30))
-    cx, cy = img_w / 2.0, img_h / 2.0
-    x = (u - cx) / fx * z
-    y = (v - cy) / fx * z
-    return (x, -y, z)
+    def draw(self, surface):
+        pygame.draw.rect(surface, (40, 45, 60), self.rect, border_radius=4)
+        pos = (self.val - self.min_val) / (self.max_val - self.min_val + 1e-6)
+        handle_x = self.rect.x + int(pos * self.rect.w)
+        handle_rect = pygame.Rect(handle_x - 8, self.rect.y - 4, 16, self.rect.h + 8)
+        color = (255, 215, 0) if self.grabbed else (180, 180, 200)
+        pygame.draw.rect(surface, color, handle_rect, border_radius=3)
+        font = pygame.font.SysFont("monospace", 14, bold=True)
+        txt = font.render(f"{self.label}: {self.val:.3f}", True, (255, 255, 255))
+        surface.blit(txt, (self.rect.x, self.rect.y - 22))
 
+    def handle_event(self, event):
+        if event.type == MOUSEBUTTONDOWN and event.button == 1:
+            if self.rect.collidepoint(event.pos): self.grabbed = True
+        if event.type == MOUSEBUTTONUP: self.grabbed = False
+        if event.type == MOUSEMOTION and self.grabbed:
+            rel_x = max(0, min(event.pos[0] - self.rect.x, self.rect.w))
+            self.val = self.min_val + (rel_x / self.rect.w) * (self.max_val - self.min_val)
+            return True
+        return False
 
-def classify(x, y, z):
-    if y < -0.4:
-        return "ground"
-    if abs(x) > 1.5:
-        return "boundary"
-    return "obstacle"
+# --- Shared pipeline state ---
+class PipelineState:
+    def __init__(self):
+        self._lock       = threading.Lock()
+        self.frame       = None
+        self.depth       = None
+        self.pts         = []
+        self.clusters    = []
+        self.midas_fps   = 0.0
+        self.depth_scale  = DEPTH_SCALE
+        self.depth_offset = DEPTH_OFFSET
 
+    def set_frame(self, f):
+        with self._lock: self.frame = f
 
-def shade(color, z):
-    b = 1.0 - (z / DEPTH_MAX) * 0.6
-    return tuple(c * b for c in color)
+    def get_frame(self):
+        with self._lock: return self.frame
 
+    def set_depth(self, d, fps):
+        with self._lock: self.depth, self.midas_fps = d, fps
 
-def get_edges(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    med  = float(np.median(blur))
-    return cv2.Canny(blur, max(0, int(0.5*med)), min(255, int(1.5*med)))
+    def set_pts(self, pts, clusters):
+        with self._lock: self.pts, self.clusters = pts, clusters
 
+    def get_render(self):
+        with self._lock:
+            return (self.frame, self.depth, self.pts, self.clusters,
+                    self.midas_fps, self.depth_scale, self.depth_offset)
 
-def edges_to_points(edges, img_w, img_h):
-    ys, xs = np.where(edges > 0)
-    xs, ys = xs[::EDGE_STEP], ys[::EDGE_STEP]
-    if len(xs) > MAX_PTS:
-        idx    = np.random.choice(len(xs), MAX_PTS, replace=False)
-        xs, ys = xs[idx], ys[idx]
-    pts = []
-    for u, v in zip(xs, ys):
-        x, y, z = pixel_to_3d(u, v, img_w, img_h)
-        pts.append((x, y, z, classify(x, y, z)))
-    return pts
+STATE = PipelineState()
 
+# --- Threads ---
+class CameraThread:
+    def __init__(self, src=0):
+        self.cap = cv2.VideoCapture(src)
+        if not self.cap.isOpened(): sys.exit(1)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_W)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
+        self.cap.set(cv2.CAP_PROP_FPS, CAM_FPS)
+        self._stop = False
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while not self._stop:
+            ret, frame = self.cap.read()
+            if ret: STATE.set_frame(cv2.flip(frame, 1))
+
+    def release(self): self._stop = True; self.cap.release()
+
+class DepthThread:
+    def __init__(self):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.fp16 = (self.device.type == "cuda")
+        self.model = torch.hub.load("intel-isl/MiDaS", "DPT_Hybrid", trust_repo=True)
+        if self.fp16: self.model = self.model.half()
+        self.model.to(self.device).eval()
+        self.transform = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True).dpt_transform
+        self._last_frame, self._qlock, self._stop, self._fps = None, threading.Lock(), False, 0.0
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def push(self, frame):
+        with self._qlock: self._last_frame = frame
+
+    def _run(self):
+        while not self._stop:
+            with self._qlock:
+                frame, self._last_frame = self._last_frame, None
+
+            if frame is None:
+                time.sleep(0.004); continue
+
+            t0 = time.perf_counter()
+            small = cv2.resize(frame, (MIDAS_W, MIDAS_H))
+            img_rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            inp = self.transform(img_rgb).to(self.device)
+            if self.fp16: inp = inp.half()
+
+            with torch.no_grad():
+                pred = self.model(inp)
+                pred = torch.nn.functional.interpolate(pred.unsqueeze(1), size=(MIDAS_H, MIDAS_W), mode="bicubic").squeeze()
+
+            disp = pred.float().cpu().numpy().astype(np.float32)
+            disp = np.nan_to_num(disp, nan=0.0, posinf=0.0, neginf=0.0)
+            disp = cv2.bilateralFilter(disp, d=9, sigmaColor=0.1, sigmaSpace=5)
+
+            p5, p95 = np.percentile(disp, 5), np.percentile(disp, 95)
+            range_val = p95 - p5
+            norm = np.clip((disp - p5) / range_val, 0.0, 1.0) if range_val > 1e-4 else np.zeros_like(disp)
+
+            depth_metric = DEPTH_MIN + (norm) * (DEPTH_MAX - DEPTH_MIN)
+            depth_metric = cv2.medianBlur(depth_metric.astype(np.float32), 5)
+
+            dt = time.perf_counter() - t0
+            self._fps = 0.8 * self._fps + 0.2 * (1.0 / max(dt, 1e-6))
+            STATE.set_depth(depth_metric, self._fps)
+
+    def stop(self): self._stop = True
+
+class VisionThread:
+    def __init__(self):
+        self._stop, self._bbox_ctr = False, 0
+        self._last_clusters = []
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while not self._stop:
+            with STATE._lock:
+                depth, scale, offset = STATE.depth, STATE.depth_scale, STATE.depth_offset
+
+            if depth is None:
+                time.sleep(0.005); continue
+
+            h, w = depth.shape
+            vs, us = np.arange(0, h, GRID_STEP), np.arange(0, w, GRID_STEP)
+            uu, vv = np.meshgrid(us, vs)
+            uu, vv = uu.ravel(), vv.ravel()
+
+            zz = (depth[vv, uu] * scale) + offset
+            valid = (zz >= DEPTH_MIN) & (zz <= DEPTH_MAX)
+            uu, vv, zz = uu[valid], vv[valid], zz[valid]
+
+            if len(uu) == 0: continue
+
+            fx = (w / 2.0) / math.tan(math.radians(CAM_FOV_DEG))
+            cx, cy = w / 2.0, h / 2.0
+            xx, yy = (uu - cx) / fx * zz, -((vv - cy) / fx * zz)
+
+            pts = []
+            for x, y, z in zip(xx, yy, zz):
+                # Filter out extreme edges to prevent classifying walls as obstacles
+                if y < -1.0:
+                    label = "ground"
+                elif abs(x) > 2.0 or z > 8.0:
+                    label = "boundary"
+                else:
+                    label = "obstacle"
+                pts.append((float(x), float(y), float(z), label))
+
+            self._bbox_ctr += 1
+            if self._bbox_ctr % DBSCAN_EVERY == 0:
+                obs = np.array([p[:3] for p in pts if p[3] == "obstacle"], dtype=np.float32)
+                new_clusters = []
+                if len(obs) > DBSCAN_MIN_PTS:
+                    lbls = DBSCAN(eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_PTS).fit_predict(obs)
+                    for cid in set(lbls):
+                        if cid == -1: continue
+                        grp = obs[lbls == cid]
+                        mn, mx = grp.min(0), grp.max(0)
+
+                        # --- WALL REJECTION FILTER ---
+                        # If the object is massively wide or tall, it's likely a wall. Ignore it.
+                        width = mx[0] - mn[0]
+                        height = mx[1] - mn[1]
+                        if width > 2.5 or height > 2.5:
+                            continue
+
+                        new_clusters.append({"box": (mn, mx)})
+                self._last_clusters = new_clusters
+
+            STATE.set_pts(pts, self._last_clusters)
+
+    def stop(self): self._stop = True
+
+# --- Rendering Functions ---
+def draw_inset(tex_id, img, x, y, w=280, h=210):
+    if img is None or not np.all(np.isfinite(img)): return
+    img_rgb = cv2.flip(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), 0)
+
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+    glBindTexture(GL_TEXTURE_2D, tex_id)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, img.shape[1], img.shape[0], 0, GL_RGB, GL_UNSIGNED_BYTE, img_rgb)
+
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); gluOrtho2D(0, WINDOW_W, 0, WINDOW_H)
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+
+    glEnable(GL_TEXTURE_2D); glDisable(GL_DEPTH_TEST)
+    glColor4f(1.0, 1.0, 1.0, 1.0)
+
+    glBegin(GL_QUADS)
+    glTexCoord2f(0,0); glVertex2f(x, y)
+    glTexCoord2f(1,0); glVertex2f(x+w, y)
+    glTexCoord2f(1,1); glVertex2f(x+w, y+h)
+    glTexCoord2f(0,1); glVertex2f(x, y+h)
+    glEnd()
+
+    glDisable(GL_TEXTURE_2D); glEnable(GL_DEPTH_TEST)
+    glMatrixMode(GL_PROJECTION); glPopMatrix()
+    glMatrixMode(GL_MODELVIEW);  glPopMatrix()
 
 def draw_grid():
-    glLineWidth(1.0)
-    glColor4f(0.15, 0.5, 0.25, 0.45)
-    glBegin(GL_LINES)
-    x = -3.0
-    while x <= 3.01:
-        glVertex3f(x, -1.2, 0.0); glVertex3f(x, -1.2, -DEPTH_MAX)
-        x += 0.5
+    glLineWidth(1.0); glColor4f(0.15, 0.5, 0.25, 0.4); glBegin(GL_LINES)
+    x = -4.0
+    while x <= 4.01:
+        glVertex3f(x, -1.2, 0.0); glVertex3f(x, -1.2, -DEPTH_MAX); x += 0.5
     z = 0.0
     while z >= -DEPTH_MAX - 0.01:
-        glVertex3f(-3.0, -1.2, z); glVertex3f(3.0, -1.2, z)
-        z -= 0.5
+        glVertex3f(-4.0, -1.2, z); glVertex3f(4.0, -1.2, z); z -= 0.5
     glEnd()
 
-
-def draw_axes():
-    glLineWidth(2.5)
-    glBegin(GL_LINES)
-    glColor3f(1, 0.2, 0.2); glVertex3f(0,0,0); glVertex3f(1.2, 0, 0)
-    glColor3f(0.2, 1, 0.2); glVertex3f(0,0,0); glVertex3f(0, 1.2, 0)
-    glColor3f(0.3, 0.5, 1); glVertex3f(0,0,0); glVertex3f(0, 0,-1.2)
-    glEnd()
-
-
-def draw_points(pts):
-    glPointSize(3.5)
-    glBegin(GL_POINTS)
-    for x, y, z, label in pts:
-        r, g, b = shade(CLASS_COLOR[label], z)
-        glColor4f(r, g, b, 1.0)
-        glVertex3f(x, y, -z)
-    glEnd()
-
-
-# TODO: draw_lidar_points() — merge LiDAR scan with camera points
-
-
-def draw_camera_inset(tex_id, frame, inset_w, inset_h):
-    rgb = np.flipud(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    glBindTexture(GL_TEXTURE_2D, tex_id)
-    h, w = rgb.shape[:2]
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, rgb)
-
-    glMatrixMode(GL_PROJECTION); glLoadIdentity()
-    gluOrtho2D(0, WINDOW_W, 0, WINDOW_H)
-    glMatrixMode(GL_MODELVIEW); glLoadIdentity()
-
-    glEnable(GL_TEXTURE_2D)
-    glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE)
-
-    x0, y0 = 10, WINDOW_H - inset_h - 10
-    x1, y1 = x0 + inset_w, y0 + inset_h
-    glColor3f(1, 1, 1)
-    glBegin(GL_QUADS)
-    glVertex3f(x0,y0,0); glVertex3f(x1,y0,0)
-    glVertex3f(x1,y1,0); glVertex3f(x0,y1,0)
-    glEnd()
-
-    glDisable(GL_TEXTURE_2D)
-    glEnable(GL_DEPTH_TEST); glDepthMask(GL_TRUE)
-
-
-def draw_hud(surface, fps, n_pts, paused):
-    surface.fill((0, 0, 0, 0))
-    mono = pygame.font.SysFont("monospace", 15)
-    bold = pygame.font.SysFont("monospace", 17, bold=True)
-
-    def t(msg, pos, col=(180,255,180), font=mono):
-        surface.blit(font.render(msg, True, col), pos)
-
-    t("CS 334 — Real-Time Vision System", (10, 10), (100, 210, 255), bold)
-    t("PAUSED" if paused else f"FPS: {fps:4.1f}   pts: {n_pts}", (10, 33))
-
-    lx, ly = WINDOW_W - 150, 10
-    t("LEGEND", (lx, ly), (200, 200, 200), bold)
-    for i, (label, (r, g, b)) in enumerate(CLASS_COLOR.items()):
-        col = (int(r*255), int(g*255), int(b*255))
-        pygame.draw.rect(surface, col, (lx, ly+22+i*20, 12, 12))
-        t(label, (lx+18, ly+20+i*20), col)
-
-    t("P-pause  Q-quit", (10, WINDOW_H - 25), (120, 120, 140))
-
-
-def blit_hud(surface):
-    raw = pygame.image.tostring(surface, "RGBA", True)
-    tid = glGenTextures(1)
-    glBindTexture(GL_TEXTURE_2D, tid)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, WINDOW_W, WINDOW_H, 0,
-                 GL_RGBA, GL_UNSIGNED_BYTE, raw)
-    glEnable(GL_TEXTURE_2D)
-    glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE)
-    glColor4f(1, 1, 1, 1)
-    glBegin(GL_QUADS)
-    glVertex3f(0,0,0);              glVertex3f(WINDOW_W,0,0)
-    glVertex3f(WINDOW_W,WINDOW_H,0); glVertex3f(0,WINDOW_H,0)
-    glEnd()
-    glDisable(GL_TEXTURE_2D)
-    glEnable(GL_DEPTH_TEST); glDepthMask(GL_TRUE)
-    glDeleteTextures([tid])
-
-
+# --- Main Execution ---
 def main():
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("No camera found."); sys.exit(1)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
+    cam, depth, vision = CameraThread(), DepthThread(), VisionThread()
     pygame.init()
     pygame.display.set_mode((WINDOW_W, WINDOW_H), DOUBLEBUF | OPENGL)
-    pygame.display.set_caption("CS 334 – Vision System")
     overlay = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+    clock = pygame.time.Clock()
 
-    glEnable(GL_DEPTH_TEST)
-    glEnable(GL_BLEND)
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    s_scale = Slider(WINDOW_W//2 - 150, WINDOW_H - 100, 300, 12, "SCALE", 0.1, 5.0, DEPTH_SCALE)
+    s_offset = Slider(WINDOW_W//2 - 150, WINDOW_H - 50, 300, 12, "OFFSET", -5.0, 5.0, DEPTH_OFFSET)
+
+    cam_tex, depth_tex, ui_tex = glGenTextures(3)
+    for t in [cam_tex, depth_tex, ui_tex]:
+        glBindTexture(GL_TEXTURE_2D, t)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+
+    glEnable(GL_DEPTH_TEST); glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
     glClearColor(0.05, 0.07, 0.12, 1.0)
 
-    cam_tex = glGenTextures(1)
-    glBindTexture(GL_TEXTURE_2D, cam_tex)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-
-    paused     = False
-    pts        = []
-    last_frame = None
-    clock      = pygame.time.Clock()
-    fps        = 0.0
+    rot_x, rot_y, mouse_down_right, paused, fps = -20.0, 0.0, False, False, 0.0
+    mono_font = pygame.font.SysFont("monospace", 15)
 
     while True:
-        dt  = clock.tick(60) / 1000.0
-        fps = 0.9*fps + 0.1*(1.0/max(dt, 1e-6))
+        dt = clock.tick(60) / 1000.0
+        fps = 0.9 * fps + 0.1 * (1.0 / max(dt, 1e-6))
 
         for event in pygame.event.get():
             if event.type == QUIT:
-                cap.release(); pygame.quit(); sys.exit()
+                vision.stop(); depth.stop(); cam.release(); pygame.quit(); sys.exit()
+
+            if event.type == MOUSEBUTTONDOWN and event.button == 3: mouse_down_right = True
+            if event.type == MOUSEBUTTONUP and event.button == 3: mouse_down_right = False
+
+            if s_scale.handle_event(event): STATE.depth_scale = s_scale.val
+            if s_offset.handle_event(event): STATE.depth_offset = s_offset.val
+
+            if event.type == MOUSEMOTION and mouse_down_right:
+                rot_y += event.rel[0] * 0.5; rot_x += event.rel[1] * 0.5
+
             if event.type == KEYDOWN:
                 if event.key in (K_ESCAPE, K_q):
-                    cap.release(); pygame.quit(); sys.exit()
-                if event.key == K_p:
-                    paused = not paused
+                    vision.stop(); depth.stop(); cam.release(); pygame.quit(); sys.exit()
+                if event.key == K_p: paused = not paused
 
         if not paused:
-            ret, frame = cap.read()
-            if ret:
-                frame      = cv2.flip(frame, 1)
-                last_frame = frame.copy()
-                edges      = get_edges(frame)
-                pts        = edges_to_points(edges, 640, 480)
+            f = STATE.get_frame()
+            if f is not None: depth.push(f)
+
+        frame, dmap, pts, clusters, midas_fps, d_scale, d_offset = STATE.get_render()
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-        glMatrixMode(GL_PROJECTION); glLoadIdentity()
-        gluPerspective(50, WINDOW_W/WINDOW_H, 0.1, 50.0)
-        glMatrixMode(GL_MODELVIEW); glLoadIdentity()
-        glTranslatef(0.0, -0.3, -4.5)
-        glRotatef(-18, 1, 0, 0)   # fixed downward tilt, no spin
+        glMatrixMode(GL_PROJECTION); glLoadIdentity(); gluPerspective(45, WINDOW_W/WINDOW_H, 0.1, 100.0)
+        glMatrixMode(GL_MODELVIEW); glLoadIdentity(); glTranslatef(0, -0.5, -5.0)
+        glRotatef(rot_x, 1, 0, 0); glRotatef(rot_y, 0, 1, 0)
 
+        # 3D Elements
         draw_grid()
-        draw_axes()
-        draw_points(pts)
+        glPointSize(3.0); glBegin(GL_POINTS)
+        for p in pts:
+            c = CLASS_COLOR[p[3]]; shade = max(0, 1-(p[2]/DEPTH_MAX))
+            glColor3f(c[0]*shade, c[1]*shade, c[2]*shade); glVertex3f(p[0], p[1], -p[2])
+        glEnd()
 
-        if last_frame is not None:
-            inset = cv2.resize(last_frame, (280, 210))
-            draw_camera_inset(cam_tex, inset, 280, 210)
+        # 2D HUD and Overlays
+        overlay.fill((0, 0, 0, 0))
+        overlay.blit(mono_font.render(f"FPS: {fps:.1f} | MiDaS: {midas_fps:.1f} | Objects: {len(clusters)}", True, (180, 255, 180)), (10, 10))
+        s_scale.draw(overlay); s_offset.draw(overlay)
 
-        glMatrixMode(GL_PROJECTION); glLoadIdentity()
-        gluOrtho2D(0, WINDOW_W, 0, WINDOW_H)
-        glMatrixMode(GL_MODELVIEW); glLoadIdentity()
-        draw_hud(overlay, fps, len(pts), paused)
-        blit_hud(overlay)
+        # Bounding Boxes (Full 3D Boxes, No Text)
+        for c in clusters:
+            mn, mx = c["box"]
+            glColor3f(1.0, 0.85, 0.1); glLineWidth(2.4)
+            # Bottom Loop
+            glBegin(GL_LINE_LOOP); glVertex3f(mn[0], mn[1], -mn[2]); glVertex3f(mx[0], mn[1], -mn[2]); glVertex3f(mx[0], mn[1], -mx[2]); glVertex3f(mn[0], mn[1], -mx[2]); glEnd()
+            # Top Loop
+            glBegin(GL_LINE_LOOP); glVertex3f(mn[0], mx[1], -mn[2]); glVertex3f(mx[0], mx[1], -mn[2]); glVertex3f(mx[0], mx[1], -mx[2]); glVertex3f(mn[0], mx[1], -mx[2]); glEnd()
+            # Vertical Pillars
+            glBegin(GL_LINES)
+            glVertex3f(mn[0], mn[1], -mn[2]); glVertex3f(mn[0], mx[1], -mn[2])
+            glVertex3f(mx[0], mn[1], -mn[2]); glVertex3f(mx[0], mx[1], -mn[2])
+            glVertex3f(mx[0], mn[1], -mx[2]); glVertex3f(mx[0], mx[1], -mx[2])
+            glVertex3f(mn[0], mn[1], -mx[2]); glVertex3f(mn[0], mx[1], -mx[2])
+            glEnd()
+
+        cx, cy = WINDOW_W // 2, WINDOW_H // 2
+        pygame.draw.line(overlay, (0, 255, 0), (cx - 15, cy), (cx + 15, cy), 2)
+        pygame.draw.line(overlay, (0, 255, 0), (cx, cy - 15), (cx, cy + 15), 2)
+
+        # --- DRAW INSETS ---
+        if frame is not None:
+            draw_inset(cam_tex, cv2.resize(frame, (280, 210)), 15, WINDOW_H - 225)
+        if dmap is not None:
+            valid_dmap = np.nan_to_num(dmap, nan=0.0, posinf=0.0, neginf=0.0)
+            d_min, d_max = valid_dmap.min(), valid_dmap.max()
+            if d_max > d_min:
+                d_viz = cv2.applyColorMap(((valid_dmap - d_min) / (d_max - d_min) * 255).astype(np.uint8), cv2.COLORMAP_MAGMA)
+            else:
+                d_viz = np.zeros((valid_dmap.shape[0], valid_dmap.shape[1], 3), dtype=np.uint8)
+            draw_inset(depth_tex, cv2.resize(d_viz, (280, 210)), WINDOW_W - 295, WINDOW_H - 225)
+
+        # Blit UI Overlay using the pre-allocated ui_tex
+        raw = pygame.image.tostring(overlay, "RGBA", True)
+        glBindTexture(GL_TEXTURE_2D, ui_tex)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, WINDOW_W, WINDOW_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, raw)
+
+        glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); gluOrtho2D(0, WINDOW_W, 0, WINDOW_H)
+        glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+
+        glEnable(GL_TEXTURE_2D); glDisable(GL_DEPTH_TEST)
+        glColor4f(1.0, 1.0, 1.0, 1.0)
+
+        glBegin(GL_QUADS)
+        glTexCoord2f(0,0); glVertex2f(0,0)
+        glTexCoord2f(1,0); glVertex2f(WINDOW_W,0)
+        glTexCoord2f(1,1); glVertex2f(WINDOW_W,WINDOW_H)
+        glTexCoord2f(0,1); glVertex2f(0,WINDOW_H)
+        glEnd()
+
+        glDisable(GL_TEXTURE_2D); glEnable(GL_DEPTH_TEST)
+        glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix()
 
         pygame.display.flip()
-
-    cap.release()
-    pygame.quit()
-
 
 if __name__ == "__main__":
     main()
